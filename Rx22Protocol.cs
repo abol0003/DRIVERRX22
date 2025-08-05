@@ -1,4 +1,5 @@
-﻿using System;
+﻿using Iot.Device.Display;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Ports;
@@ -26,79 +27,168 @@ namespace Driver_RX22
     }
 
     /// <summary>
+    /// EasyWave error codes offset 2 of ICP frame
+    /// </summary>
+    public enum EasyWaveErrorCode : byte
+    {
+        Success = 0x00,
+        ErrCanceled = 0x01,
+        ErrOutOfQueue = 0x02,
+        ErrInvalidRequest = 0x03,
+        ErrSizeMismatch = 0x04,
+        ErrInvalidParam = 0x05,
+        ErrIncompleteFw = 0x06,
+        ErrTimeout = 0x07,
+        ErrInvalidSerial = 0x08,
+        ErrSuperseded = 0x09,
+        ErrMemory = 0x0D,
+        ErrTooLate = 0x0E,
+    }
+
+    /// <summary>
     /// Protocol layer for EasyWave RX22 IRP/ICP commands,
     /// </summary>
     public class Rx22Protocol
     {
-        private readonly Rx22Driver _driver;
+        private readonly Rx22Driver driver;
+        private TaskCompletionSource<byte[]>? pendingRcvTcs; // Tracks pending ReceiveNotification IRP per spec p22
 
         public Rx22Protocol(Rx22Driver driver)
         {
-            _driver = driver ?? throw new ArgumentNullException(nameof(driver)); 
+            this.driver = driver ?? throw new ArgumentNullException(nameof(driver));
+        }
+
+        public class EasyWaveProtocolException : Exception
+        {
+            public EasyWaveProtocolException(EasyWaveErrorCode code)
+                : base($"EasyWave error 0x{(byte)code:X2}: {code}") { }
+        }
+
+        private static void EnsureStatusIsOk(ReadOnlySpan<byte> icp)
+        {
+            if (icp.Length < 3)
+                throw new EasyWaveProtocolException(EasyWaveErrorCode.ErrInvalidRequest);
+            var code = (EasyWaveErrorCode)icp[2];
+            if (code != EasyWaveErrorCode.Success)
+                Console.WriteLine($"EasyWave error 0x{(byte)code:X2}: {code}");
+                //throw new EasyWaveProtocolException(code);
         }
 
         /// <summary>
         /// Sends an IRP (commandCode + payload) and waits for the ICP.
+        /// Implements supersedure for ReceiveNotification IRPs.
         /// </summary>
         private async Task<byte[]> SendIRP(
-            EasyWaveCommand commandCode, // EasyWave command
+            EasyWaveCommand commandCode,
             byte[] payload,
             CancellationToken token = default)
         {
-            byte[] irp = new byte[1+payload.Length]; // construct IRP frame
+            TaskCompletionSource<byte[]> tcs;
+            if (commandCode == EasyWaveCommand.ReceiveNotification)
+            {
+                if (pendingRcvTcs is { Task.IsCompleted: false })
+                {
+                    pendingRcvTcs.TrySetResult(new byte[] { 0x00, 0x00, (byte)EasyWaveErrorCode.ErrSuperseded });
+                }
+                // Specially for EWB_RCV
+                pendingRcvTcs = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+                tcs = pendingRcvTcs;// keep memory of status of the irp if waiting or not if => pudate with new one
+            }
+            else// For other not yet well implemented 
+            {
+                tcs = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+                // allow to make await for the Handler when the trame arrive and wait for the response via tcs.Task
+
+            }
+
+            byte[] irp = new byte[1 + payload.Length];
             irp[0] = (byte)commandCode;
             Array.Copy(payload, 0, irp, 1, payload.Length);
 
-            var tcs = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously); //keep the task alive until we receive the ICP response
             ushort expectedHandle = 0;
-
             void Handler(byte[] frameData)
-            {   // Handle response without expecting command code in ICP
-                if (frameData.Length < 3) return;
-                // Parse big-endian handle and status
-                ushort handle = (ushort)((frameData[0] << 8) | frameData[1]);
-                byte status = frameData[2];
-
-                // Synchronous response: handle == 0 and status == 0
-                if (handle == 0 && status == 0)
+            {
+                if (frameData.Length == 2)// IPP
                 {
-                    tcs.TrySetResult(frameData);
+                    expectedHandle = (ushort)((frameData[0] << 8) | frameData[1]); // Combine 2 bytes into 1 unshort of 16 bits
+                    return;
                 }
-                // Asynchronous pending (IPP): status == 1
-                else if (status == 1)
+                if (frameData.Length >= 3)// ICP
                 {
-                    expectedHandle = handle;
-                }
-                // Asynchronous final ICP: handle matches and status == 0
-                else if (handle == expectedHandle && status == 0)
-                {
-                    tcs.TrySetResult(frameData);
+                    ushort handle = (ushort)((frameData[0] << 8) | frameData[1]);
+                    if (handle == 0 || handle == expectedHandle)
+                        tcs.TrySetResult(frameData);
                 }
             }
 
-            _driver.FrameReceived += Handler;// do it there to capture response before sending the command
+            driver.FrameReceived += Handler; // We "subscribe" to Handler when Receiving
             try
             {
-                await _driver.SendAsync(irp, token).ConfigureAwait(false);
-                return await tcs.Task.ConfigureAwait(false);// wait for handler to receive the icp response
+                await driver.SendAsync(irp, token).ConfigureAwait(false);
+                var icp = await tcs.Task.ConfigureAwait(false);
+                EnsureStatusIsOk(icp);
+                return icp;
             }
             finally
             {
-                _driver.FrameReceived -= Handler;//desabonne from the event to avoid memory leaks
+                driver.FrameReceived -= Handler;// We "unsubscribe" to Handler 
             }
         }
+        ////// Specific EasyWave commands//////
+        /// EWB_RCV: receive Bidi notifications payload
+        public class EwbRcvInfo
+        {
+            public ushort Handle { get; init; }
+            public byte Status { get; init; }
+            public byte InfoType { get; init; }
+            public byte[] DeviceSerial { get; init; } = Array.Empty<byte>();
+            public byte[] Additional { get; init; } = Array.Empty<byte>();
+        }
 
-        ////// Specific EasyWave commands (use enum and constants instead of magic numbers) //////
+        public async Task<EwbRcvInfo> ReceiveNotificationAsync(CancellationToken token = default)
+        {
+            byte[] icp = await SendIRP(EasyWaveCommand.ReceiveNotification, Array.Empty<byte>(), token).ConfigureAwait(false);
+
+            if (icp.Length == 3)
+            {
+                Console.WriteLine($"Canceled IRP request with ICP: {BitConverter.ToString(icp)}");
+                // On construit un EwbRcvInfo minimal
+                return new EwbRcvInfo
+                {
+                    Handle = 0,
+                    Status = icp[2],  
+                    InfoType = 0,
+                    DeviceSerial = Array.Empty<byte>(),
+                    Additional = Array.Empty<byte>()
+                };
+            }
+            else if (icp.Length < 28)
+            {
+                throw new InvalidOperationException($"ReceiveNotification failed (len={icp.Length})");
+            }
+
+            return new EwbRcvInfo
+            {
+                Handle = (ushort)((icp[0] << 8) | icp[1]),
+                Status = icp[2],
+                InfoType = icp[3],
+                DeviceSerial = icp.Skip(4).Take(16).ToArray(),
+                Additional = icp.Skip(20).Take(8).ToArray()
+            };
+        }
+
+
+
+        //////////////////////////////////////////////////////////////////////////////////////
+
 
         /// EWB_GET_FD_SERIAL : read the serial number of a device
         public async Task<byte[]> GetFdSerialAsync(
             ushort index,
             CancellationToken token = default)
         {
-            byte[] idx = BitConverter.GetBytes(IPAddress.HostToNetworkOrder((short)index));
-            byte[] icp = await SendIRP(EasyWaveCommand.GetFdSerial, idx, token).ConfigureAwait(false);
-            if (icp[2] != 0)
-                throw new InvalidOperationException($"GetFdSerial failed (status=0x{icp[2]:X2})");
+            byte[] idx = BitConverter.GetBytes(IPAddress.HostToNetworkOrder((short)index)); // convert index to big-endian (between 0 and 128)
+            byte[] icp = await SendIRP(EasyWaveCommand.GetFdSerial, idx, token).ConfigureAwait(false);// ConfigureAwait(false) better for asynch programming to avoid deadlocks
 
             return icp.Skip(3).Take(16).ToArray();
         }
@@ -111,9 +201,7 @@ namespace Driver_RX22
             if (serial.Length != 16)
                 throw new ArgumentException("Serial must be exactly 16 bytes", nameof(serial));
             // Is always structured so no need to make it big endian
-            byte[] icp = await SendIRP(EasyWaveCommand.AddFilter, serial, token).ConfigureAwait(false);
-            if (icp[2] != 0)
-                throw new InvalidOperationException($"AddFilter failed (status=0x{icp[2]:X2})");
+            await SendIRP(EasyWaveCommand.AddFilter, serial, token).ConfigureAwait(false);
         }
 
         /// EWB_JOIN_DEVICE : Join a device into the network, returns the device serial and type.
@@ -122,8 +210,6 @@ namespace Driver_RX22
             CancellationToken token = default)
         {
             byte[] icp = await SendIRP(EasyWaveCommand.JoinDevice, gatewaySerial, token).ConfigureAwait(false);
-            if (icp[2] != 0)
-                throw new InvalidOperationException($"JoinDevice failed (status=0x{icp[2]:X2})");
 
             var serial = icp.Skip(3).Take(16).ToArray();
             byte type = icp[19];
@@ -148,9 +234,7 @@ namespace Driver_RX22
             payload[32] = mode;
             Array.Copy(state, 0, payload, 33, 4);
 
-            byte[] icp = await SendIRP(EasyWaveCommand.ChangeState, payload, token).ConfigureAwait(false);
-            if (icp[2] != 0)
-                throw new InvalidOperationException($"ChangeState failed (status=0x{icp[2]:X2})");
+            await SendIRP(EasyWaveCommand.ChangeState, payload, token).ConfigureAwait(false);
         }
 
         /// EWB_TRLRN_CONTROL : Learn or remove a transmitter like button wc or room
@@ -173,9 +257,7 @@ namespace Driver_RX22
             payload[33] = mode;
             Array.Copy(state, 0, payload, 34, 4);
 
-            byte[] icp = await SendIRP(EasyWaveCommand.LearnControl, payload, token).ConfigureAwait(false);
-            if (icp[2] != 0)
-                throw new InvalidOperationException($"LearnControl failed (status=0x{icp[2]:X2})");
+            await SendIRP(EasyWaveCommand.LearnControl, payload, token).ConfigureAwait(false);
         }
 
         /// EWB_REMOVE_DEVICE: remove a device from the network filter
@@ -189,47 +271,14 @@ namespace Driver_RX22
             var payload = new byte[32];
             Array.Copy(initialSerial, 0, payload, 0, 16);
             Array.Copy(joinedSerial, 0, payload, 16, 16);
-            byte[] icp = await SendIRP(EasyWaveCommand.RemoveDevice, payload, token).ConfigureAwait(false);
-            if (icp[2] != 0)
-                throw new InvalidOperationException($"RemoveDevice failed (status=0x{icp[2]:X2})");
+            await SendIRP(EasyWaveCommand.RemoveDevice, payload, token).ConfigureAwait(false);
         }
 
         /// EWB_CLEAR_NFILTER: clear all filters
         public async Task ClearFilterAsync(
             CancellationToken token = default)
         {
-            byte[] icp = await SendIRP(EasyWaveCommand.ClearFilter, Array.Empty<byte>(), token).ConfigureAwait(false);
-            if (icp[2] != 0)
-                throw new InvalidOperationException($"ClearFilter failed (status=0x{icp[2]:X2})");
-        }
-
-        /// EWB_RCV: receive Bidi notifications payload
-        public class EwbRcvInfo
-        {
-            public ushort Handle { get; init; }            // link btw ipp and icp
-
-            public byte Status { get; init; }            // status of the notification for debug purposes
-
-            public byte InfoType { get; init; }
-            public byte[] DeviceSerial { get; init; } = Array.Empty<byte>();
-            public byte[] Additional { get; init; } = Array.Empty<byte>();
-        }
-
-        public async Task<EwbRcvInfo> ReceiveNotificationAsync(
-            CancellationToken token = default)
-        {
-            byte[] icp = await SendIRP(EasyWaveCommand.ReceiveNotification, Array.Empty<byte>(), token).ConfigureAwait(false);
-            if (icp.Length < 28 || icp[2] != 0)
-                throw new InvalidOperationException($"ReceiveNotification failed (status=0x{(icp.Length >= 3 ? icp[2] : 0):X2})");
-
-            return new EwbRcvInfo
-            {
-                Handle = (ushort)((icp[0] << 8) | icp[1]),
-                Status = icp[2],
-                InfoType = icp[3],
-                DeviceSerial = icp.Skip(4).Take(16).ToArray(),
-                Additional = icp.Skip(20).Take(8).ToArray()
-            };
+            await SendIRP(EasyWaveCommand.ClearFilter, Array.Empty<byte>(), token).ConfigureAwait(false);
         }
 
         /// EWB_QUERY_STATE: query mode and state
@@ -246,8 +295,6 @@ namespace Driver_RX22
             Array.Copy(joinedSerial, 0, payload, 16, 16);
             payload[32] = mode;
             byte[] icp = await SendIRP(EasyWaveCommand.QueryState, payload, token).ConfigureAwait(false);
-            if (icp[2] != 0)
-                throw new InvalidOperationException($"QueryState failed (status=0x{icp[2]:X2})");
             return icp.Skip(3).Take(8).ToArray();
         }
     }

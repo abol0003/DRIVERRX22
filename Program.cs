@@ -1,4 +1,5 @@
-﻿using System;
+﻿using EasyWaveApp;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Ports;
@@ -8,58 +9,67 @@ using System.Threading.Tasks;
 
 
 namespace Driver_RX22
+
 {
     class Program
     {
-        //static async Task Main(string[] args)
         static async Task Main()
         {
-            /*            string portName = Environment.GetEnvironmentVariable("RX22_PORT")
-                  ?? (args.Length > 0 ? args[0] : null)
-                  ?? GetDefaultPort();
-
-            Console.WriteLine($"→ Serie Port : {portName}");
-            var driver = new Rx22Driver(portName);*/
-
-            var driver = new Rx22Driver("COM5"); // instantiation of UART driver
-            driver.FrameReceived += data =>
+            // List available COM ports 
+           /* string[] ports = SerialPort.GetPortNames();
+            if (ports.Length == 0)
             {
-                Console.WriteLine("Rx frame: " + BitConverter.ToString(data));
-            };
+                Console.WriteLine("No COM ports detected.");
+                return;
+            }
+
+            Console.WriteLine("Available COM ports:");
+            for (int i = 0; i < ports.Length; i++)
+                Console.WriteLine($"  [{i}] {ports[i]}");
+
+            Console.Write("Enter the port to use: ");
+            if (!int.TryParse(Console.ReadLine(), out int idx) || idx < 0 || idx >= ports.Length)
+            {
+                Console.WriteLine("Invalid.");
+                return;
+            }*/
+            string portName = "/dev/ttyS0";// ports[idx];
+            Console.WriteLine($"Using port: {portName}");
+
+            // Instantiate and open the driver
+            var driver = new Rx22Driver(portName);
+            //////////////////
+            driver.FrameReceived += frame =>
+                Console.WriteLine("frame received: " + BitConverter.ToString(frame));
             driver.Open();
-            // Protocol handling
+
             var protocol = new Rx22Protocol(driver);
 
-            //clear any existing filters
-            await protocol.ClearFilterAsync();
+            // Send the EWB_RCV command 
+            // 3) Instanciation du service de notifications
+            //    On part d’une liste vide pour forcer le pairing interactif
+            var service = new NotificationService(protocol);
 
-            // IRP of serial number of PI4
-            byte[] id = await protocol.GetFdSerialAsync(0); // get the serial number of the device at index 0
-            Console.WriteLine("Serial index 0: " + BitConverter.ToString(id));
+            Console.WriteLine("Starting notification loop. Press Ctrl+C to exit.");
+            using var cts = new CancellationTokenSource();
+            Console.CancelKeyPress += (_, e) =>
+            {
+                e.Cancel = true;
+                cts.Cancel();
+            };
 
-            await protocol.AddFilterAsync(id);  // Add this ID to the module’s whitelist filter
-            var (devSerial, devType) = await protocol.JoinDeviceAsync(id); // return device type and serial number
-            Console.WriteLine($"Joined device {BitConverter.ToString(devSerial)} (type {devType})"); // confirm inclusion
-            driver.Dispose();
+            // 4) Lancement de la boucle asynchrone
+            await service.RunAsync(cts.Token);
+
+            Console.WriteLine("Exited.");
         }
-        /*        // Remove at the end => this is just for testing and get a port on PC
-        static string GetDefaultPort()
-        {
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                return "COM3";              // remplacer par ton COM réel
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-                return "/dev/serial0";      // sur Raspberry Pi
-            throw new PlatformNotSupportedException();
-        }*/
     }
 
 
-
-
-/// <summary>
-/// Driver for the EasyWave RX22 module.
-/// </summary>
-public class Rx22Driver : IDisposable
+    /// <summary>
+    /// Driver for the EasyWave RX22 module.
+    /// </summary>
+    public class Rx22Driver : IDisposable
     {
         private const byte SOP = 0x81;
         private const byte EOP = 0x82;
@@ -111,7 +121,6 @@ public class Rx22Driver : IDisposable
             byte[] framed = Frame(payload); // add SOP, EOP and byte stuffing
             if (simulate)
             {
-                // En simulation, on n’écrit pas sur le port : on renvoie simplement la tâche terminée
                 return;
             }
             await writeLock.WaitAsync(cancellation).ConfigureAwait(false); // wait to get token to enable acces to port ( avoid 2 simultaneous writes )
