@@ -1,56 +1,69 @@
-﻿using EasyWaveApp;
-using System;
-using System.Collections.Generic;
-using System.IO;
+﻿using System;
 using System.IO.Ports;
-using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
-
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Driver_RX22;
+using EasyWaveApp;
 
 namespace Driver_RX22
-
 {
     class Program
     {
         static async Task Main()
         {
-            // List available COM ports 
-           /* string[] ports = SerialPort.GetPortNames();
-            if (ports.Length == 0)
-            {
-                Console.WriteLine("No COM ports detected.");
-                return;
-            }
-
-            Console.WriteLine("Available COM ports:");
-            for (int i = 0; i < ports.Length; i++)
-                Console.WriteLine($"  [{i}] {ports[i]}");
-
-            Console.Write("Enter the port to use: ");
-            if (!int.TryParse(Console.ReadLine(), out int idx) || idx < 0 || idx >= ports.Length)
-            {
-                Console.WriteLine("Invalid.");
-                return;
-            }*/
-            string portName = "/dev/ttyS0";// ports[idx];
+            string portName = "/dev/ttyS0";
             Console.WriteLine($"Using port: {portName}");
 
-            // Instantiate and open the driver
-            var driver = new Rx22Driver(portName);
-            //////////////////
+            // 1) Configure the DI container
+            var services = new ServiceCollection()
+                .AddLogging(builder =>
+                {
+                    builder.AddConsole();
+                    builder.SetMinimumLevel(LogLevel.Debug);
+                })
+                // Register Rx22Driver as a singleton, resolving ILogger<Rx22Driver> automatically
+                .AddSingleton<Rx22Driver>(sp =>
+                    new Rx22Driver(portName,
+                        sp.GetRequiredService<ILogger<Rx22Driver>>()))
+                // Protocol and services rely on constructor-based DI
+                .AddSingleton<Rx22Protocol>()
+                .AddSingleton<NotificationService>()
+                .AddSingleton<Tx>()
+                .BuildServiceProvider();
+
+            // 2) Resolve the main services and use them
+            var logger = services.GetRequiredService<ILogger<Program>>();
+            var driver = services.GetRequiredService<Rx22Driver>();
+            var protocol = services.GetRequiredService<Rx22Protocol>();
+            var notifier = services.GetRequiredService<NotificationService>();
+            var transmitter = services.GetRequiredService<Tx>();
+
+            logger.LogInformation("Starting driver on {Port}", portName);
             driver.FrameReceived += frame =>
-                Console.WriteLine("frame received: " + BitConverter.ToString(frame));
+                logger.LogInformation("Frame received: {Frame}", BitConverter.ToString(frame));
             driver.Open();
 
-            var protocol = new Rx22Protocol(driver);
+            // TX //
 
-            // Send the EWB_RCV command 
-            // 3) Instanciation du service de notifications
-            //    On part d’une liste vide pour forcer le pairing interactif
-            var service = new NotificationService(protocol);
+            try
+            {
+                ushort index = 1; // index for forward serial
+                byte[] serial = await transmitter.GetForwardSerialAsync(index);
+                logger.LogInformation("Got FD serial: {Serial}", BitConverter.ToString(serial));
 
-            Console.WriteLine("Starting notification loop. Press Ctrl+C to exit.");
+                byte functionCode = 0x01; // example function
+                await transmitter.SendCommandAsync(serial, functionCode);
+                logger.LogInformation("Sent button command fn={Function}", functionCode);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Error during TX operations");
+            }
+
+            // RX //
+            // Start the notification loop
             using var cts = new CancellationTokenSource();
             Console.CancelKeyPress += (_, e) =>
             {
@@ -58,23 +71,23 @@ namespace Driver_RX22
                 cts.Cancel();
             };
 
-            // 4) Lancement de la boucle asynchrone
-            await service.RunAsync(cts.Token);
-
-            Console.WriteLine("Exited.");
+            logger.LogInformation("Launching notification loop");
+            await notifier.RunAsync(cts.Token);
+            logger.LogInformation("Application stopping");
         }
     }
 
 
-    /// <summary>
-    /// Driver for the EasyWave RX22 module.
-    /// </summary>
-    public class Rx22Driver : IDisposable
+/// <summary>
+/// Driver for the EasyWave RX22 module.
+/// </summary>
+public class Rx22Driver : IDisposable
     {
         private const byte SOP = 0x81;
         private const byte EOP = 0x82;
         private const byte ESC = 0x80;
 
+        private readonly ILogger<Rx22Driver> _logger;
         private readonly SerialPort serialPort;
         private readonly SemaphoreSlim writeLock = new SemaphoreSlim(1, 1); // ensures only one frame is written at a time
         private readonly CancellationTokenSource cts = new CancellationTokenSource(); // Token source for signaling and canceling the background receive loop
@@ -89,8 +102,9 @@ namespace Driver_RX22
         /// </summary>
         public event Action<byte[]> FrameReceived = delegate { }; // delegate to avoid error if null
 
-        public Rx22Driver(string portName)
+        public Rx22Driver(string portName, ILogger<Rx22Driver> logger)
         {
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             simulate = portName == "SIM";
             serialPort = new SerialPort(portName, 115200, Parity.None, 8, StopBits.One) // 115200 baud, 8N1 => see spec
             {
@@ -105,7 +119,7 @@ namespace Driver_RX22
         /// </summary>
         public void Open()
         {
-            if (simulate) return;           // <— skip opening in simulation
+            if (simulate) return;           // skip opening in simulation
 
             if (serialPort.IsOpen) return; // Avoid reopening if already open
             serialPort.Open();
@@ -186,7 +200,7 @@ namespace Driver_RX22
                 }
                 catch (Exception ex)
                 {
-                    Console.Error.WriteLine($"RX22 ReceiveLoop error: {ex}");
+                    _logger.LogError(ex, "RX22 ReceiveLoop error");
                     break; // Exit the loop on any error
                 }
                 // If to many errors maybe add a close and open port to remake the link
@@ -273,7 +287,7 @@ namespace Driver_RX22
         /// <summary>
         /// For simulation: inject raw bytes into the internal buffer and process them.
         /// </summary>
-        public void FeedRawData(byte[] chunk) 
+        public void FeedRawData(byte[] chunk)
         {
             rxBuffer.Write(chunk, 0, chunk.Length);
             ProcessPayload();

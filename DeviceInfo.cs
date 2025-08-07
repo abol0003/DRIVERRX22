@@ -2,6 +2,7 @@
 using System.Threading;
 using System.Threading.Tasks;
 using Driver_RX22;
+using Microsoft.Extensions.Logging;
 
 namespace EasyWaveApp
 {
@@ -35,10 +36,12 @@ namespace EasyWaveApp
     public class NotificationService
     {
         private readonly Rx22Protocol _protocol;
+        private readonly ILogger<NotificationService> _logger;
 
-        public NotificationService(Rx22Protocol protocol)
+        public NotificationService(Rx22Protocol protocol, ILogger<NotificationService> logger)
         {
             _protocol = protocol ?? throw new ArgumentNullException(nameof(protocol));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         }
 
         public async Task RunAsync(CancellationToken ct)
@@ -56,7 +59,7 @@ namespace EasyWaveApp
                 }
                 catch (Exception ex)
                 {
-                    Console.Error.WriteLine($"Receive error: {ex.Message}");
+                    _logger.LogError(ex, "Receive error");
                     continue;
                 }
 
@@ -77,33 +80,33 @@ namespace EasyWaveApp
                         PushFunction fn = (PushFunction)((b >> 2) & 0x3F);
                         if (fn == PushFunction.LowBattery)
                         {
-                            Console.WriteLine($"[{identifier}] Low battery alert");
+                            _logger.LogInformation("[{Identifier}] Low battery alert", identifier);
                         }
                         else
                         {
-                            Console.WriteLine($"[{identifier}] Button {btn} pressed, function {fn}");
+                            _logger.LogInformation("[{Identifier}] Button {Button} pressed, function {Function}", identifier, btn, fn);
                         }
                         break;
                     }
                 case InfoType.Release:
                     {
                         Button btn = (Button)(info.Additional[0] & 0x03);
-                        Console.WriteLine($"[{identifier}] Button {btn} released");
+                        _logger.LogInformation("[{Identifier}] Button {Button} released", identifier, btn);
                         break;
                     }
                 case InfoType.Sensor:
-                    Console.WriteLine($"[{identifier}] Sensor data: {BitConverter.ToString(info.Additional)}");
+                    _logger.LogInformation("[{Identifier}] Sensor data: {Data}", identifier, BitConverter.ToString(info.Additional));
                     break;
                 case InfoType.StateChange:
-                    Console.WriteLine($"[{identifier}] State change, mode={info.Additional[0]}, state={BitConverter.ToString(info.Additional, 1, 4)}");
+                    _logger.LogInformation("[{Identifier}] State change, mode={Mode}, state={State}", identifier, info.Additional[0], BitConverter.ToString(info.Additional, 1, 4));
                     break;
                 case InfoType.LearnStart:
                 case InfoType.LearnComplete:
                 case InfoType.LearnFail:
-                    Console.WriteLine($"[{identifier}] Learn event: {info.InfoType}");
+                    _logger.LogInformation("The {Identifier} Learn event: {Event}", identifier, info.InfoType);
                     break;
                 default:
-                    Console.WriteLine($"[{identifier}] Unhandled InfoType: {info.InfoType}");
+                    _logger.LogInformation("The {Identifier} Unhandled InfoType: {Event}", identifier, info.InfoType);
                     break;
             }
         }
