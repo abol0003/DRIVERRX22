@@ -17,6 +17,7 @@ namespace Driver_RX22
     public enum EasyWaveCommand : byte
     {
         GetFdSerial = 0x21,
+        GetFdSerialLegacy = 0x20, // EW_GET_FD_SERIAL for EW_SEND_CMD (non-bidi)  spec p.90
         AddFilter = 0x07,
         JoinDevice = 0x04,
         ChangeState = 0x09,
@@ -105,7 +106,7 @@ namespace Driver_RX22
             byte[] irp = new byte[1 + payload.Length];
             irp[0] = (byte)commandCode;
             Array.Copy(payload, 0, irp, 1, payload.Length);
-            Console.WriteLine($"Sending IRP {commandCode} with payload: {BitConverter.ToString(irp)}");
+            //Console.WriteLine($"Sending IRP {commandCode} with payload: {BitConverter.ToString(irp)}");
             ushort expectedHandle = 0;
             void Handler(byte[] frameData)
             {
@@ -128,7 +129,7 @@ namespace Driver_RX22
                 await driver.SendAsync(irp, token).ConfigureAwait(false);
                 var icp = await tcs.Task.ConfigureAwait(false);
                 EnsureStatusIsOk(icp, _logger);
-                _logger.LogDebug("Received ICP {Icp}", BitConverter.ToString(icp));
+                //_logger.LogDebug("Received ICP {Icp}", BitConverter.ToString(icp));
                 return icp;
             }
             finally
@@ -204,6 +205,14 @@ namespace Driver_RX22
             payload[16] = function;
 
             await SendIRP(EasyWaveCommand.SendCommand, payload, ct);
+        }
+        // Read a TX serial for EW_SEND_CMD (EW_GET_FD_SERIAL)
+        public async Task<byte[]> GetTxSerialAsync(ushort index, CancellationToken token = default)
+        {
+            // Big-endian index 0..127 (per spec)
+            byte[] idx = BitConverter.GetBytes(IPAddress.HostToNetworkOrder((short)index));
+            byte[] icp = await SendIRP(EasyWaveCommand.GetFdSerialLegacy, idx, token).ConfigureAwait(false);
+            return icp.Skip(3).Take(16).ToArray();
         }
 
 

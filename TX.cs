@@ -2,6 +2,7 @@
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
+using EasyWaveApp;
 
 namespace Driver_RX22
 {
@@ -19,13 +20,12 @@ namespace Driver_RX22
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         }
 
-        /// <summary>
-        /// Retrieve encrypted forward serial (EW_GET_FD_SERIAL).
-        /// </summary>
-        public Task<byte[]> GetForwardSerialAsync(ushort index, CancellationToken ct = default)
+        public static byte BuildFunctionByte(Button button, PushFunction function)
         {
-            _logger.LogInformation("Get FD serial at {Index}", index);
-            return _protocol.GetFdSerialAsync(index, ct);
+            // Ensure only the lowest 2 bits of button and lowest 6 bits of function are used
+            byte btn = (byte)((byte)button & 0x03);
+            byte fn6 = (byte)((byte)function & 0x3F);
+            return (byte)((fn6 << 2) | btn);
         }
 
         /// <summary>
@@ -33,7 +33,8 @@ namespace Driver_RX22
         /// </summary>
         public Task SendCommandAsync(byte[] serial, byte function, CancellationToken ct = default)
         {
-            _logger.LogInformation("Send single command to {Serial}, fn={Function}", BitConverter.ToString(serial), function);
+            _logger.LogInformation("Send single command to {Serial}, fn={Function}",
+                BitConverter.ToString(serial), function);
             return _protocol.SendCommandAsync(serial, function, ct);
         }
 

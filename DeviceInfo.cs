@@ -85,6 +85,7 @@ namespace EasyWaveApp
                         else
                         {
                             _logger.LogInformation("[{Identifier}] Button {Button} pressed, function {Function}", identifier, btn, fn);
+                            Console.WriteLine($"[{identifier}] Button {btn} pressed, function {fn}");
                         }
                         break;
                     }

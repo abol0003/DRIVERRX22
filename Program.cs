@@ -4,6 +4,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using System.Device.Gpio;
+using System.Diagnostics; // Stopwatch
 using Driver_RX22;
 using EasyWaveApp;
 
@@ -31,6 +33,8 @@ namespace Driver_RX22
                 .AddSingleton<Rx22Protocol>()
                 .AddSingleton<NotificationService>()
                 .AddSingleton<Tx>()
+                // GPIO reset/test service
+                .AddSingleton<GpioHandling>()
                 .BuildServiceProvider();
 
             // 2) Resolve the main services and use them
@@ -39,49 +43,168 @@ namespace Driver_RX22
             var protocol = services.GetRequiredService<Rx22Protocol>();
             var notifier = services.GetRequiredService<NotificationService>();
             var transmitter = services.GetRequiredService<Tx>();
+            var gpio = services.GetRequiredService<GpioHandling>();
 
             logger.LogInformation("Starting driver on {Port}", portName);
             driver.FrameReceived += frame =>
                 logger.LogInformation("Frame received: {Frame}", BitConverter.ToString(frame));
             driver.Open();
 
-            // TX //
+            Console.WriteLine();
+            Console.WriteLine("Select test:");
+            Console.WriteLine("  1) Reception");
+            Console.WriteLine("  2) Emission");
+            Console.WriteLine("  3) Reset + Relays/LEDs ");
+            Console.Write("Choice : ");
+            var choice = Console.ReadLine()?.Trim();
 
-            try
+            switch (choice)
             {
-                ushort index = 1; // index for forward serial
-                byte[] serial = await transmitter.GetForwardSerialAsync(index);
-                logger.LogInformation("Got FD serial: {Serial}", BitConverter.ToString(serial));
+                case "1":
+                    //  --- TX ---
+                    using (var cts = new CancellationTokenSource())
+                    {
+                        Console.CancelKeyPress += (_, e) =>
+                        {
+                            e.Cancel = true;
+                            cts.Cancel();
+                        };
 
-                byte functionCode = 0x01; // example function
-                await transmitter.SendCommandAsync(serial, functionCode);
-                logger.LogInformation("Sent button command fn={Function}", functionCode);
+                        logger.LogInformation("Launching notification loop (press Ctrl+C to stop)...");
+                        await notifier.RunAsync(cts.Token);
+                        logger.LogInformation("Notification loop stopped.");
+                    }
+                    break;
+
+                case "2":
+                    //  --- TX ---
+                    try
+                    {
+                        ushort index = 1; // index for serial btwn 0 and 127
+                        var ct = CancellationToken.None;
+
+                        byte[] serial = await protocol.GetTxSerialAsync(index, ct);
+                        if (serial == null || serial.Length == 0)
+                        {
+                            logger.LogWarning("FD serial is null or empty for index={Index}", index);
+                            break;
+                        }
+
+                        logger.LogInformation("FD serial[{Len}]: {Serial}",
+                            serial.Length, BitConverter.ToString(serial));
+
+                        // Choose the button and function to test
+                        byte fn = Tx.BuildFunctionByte(Button.A, PushFunction.Default);
+                        logger.LogInformation("TX test start");
+
+                        // Send a short burst 
+                        await transmitter.SendBurstAsync(
+                            serial,
+                            fn,
+                            count: 5,       // send 5 frames
+                            delayMs: 120,   // 120 ms between frames
+                            ct: ct
+                        );
+
+                        logger.LogInformation("TX test completed");
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, "TX test failed");
+                    }
+                    break;
+
+                case "3":
+                    // --- GPIO RESET SEQUENCE (active-low, open-drain on module) ---
+                    try
+                    {
+                        await gpio.PulseResetAsync(24, 50); // GPIO24, 50 ms pulse
+                        await Task.Delay(100);              
+                        logger.LogInformation("GPIO reset sequence completed on GPIO24.");
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, "GPIO reset failed");
+                        break;
+                    }
+
+                    // --- Functional readiness probe after reset ---
+                    // NOTE: we poll a simple command with a short per-try timeout until the module answers again.
+                    try
+                    {
+                        ushort probeIndex = 1;                         // index used for probing
+                        var overallTimeout = TimeSpan.FromSeconds(6);  // total time budget
+                        var perTryTimeout = TimeSpan.FromMilliseconds(150);
+                        var interval = TimeSpan.FromMilliseconds(200);
+                        var sw = Stopwatch.StartNew();
+                        Exception? lastErr = null;
+                        bool ready = false;
+
+                        while (sw.Elapsed < overallTimeout)
+                        {
+                            try
+                            {
+                                using var ctsProbe = new CancellationTokenSource(perTryTimeout);
+                                byte[] serialProbe = await protocol.GetTxSerialAsync(probeIndex, ctsProbe.Token);
+                                if (serialProbe != null && serialProbe.Length == 16)
+                                {
+                                    logger.LogInformation("RX22 READY after reset in {Elapsed} ms; serial={Serial}",
+                                        sw.ElapsedMilliseconds, BitConverter.ToString(serialProbe));
+                                    ready = true;
+                                    break;
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                // Expected while the module is rebooting: timeouts, IO errors, etc.
+                                lastErr = ex;
+                            }
+
+                            await Task.Delay(interval);
+                        }
+
+                        if (!ready)
+                        {
+                            logger.LogWarning("RX22 did not respond within {Ms} ms after reset. Last error: {Err}",
+                                overallTimeout.TotalMilliseconds, lastErr?.Message);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, "Functional check after reset failed");
+                    }
+
+                    // --- Test relays/LEDs via IO5 & IO6 ---
+                    try
+                    {
+                        await gpio.SetPinAsync(5, true); await Task.Delay(200);
+                        await gpio.SetPinAsync(5, false); await Task.Delay(100);
+                        await gpio.SetPinAsync(6, true); await Task.Delay(200);
+                        await gpio.SetPinAsync(6, false);
+                        logger.LogInformation("GPIO quick test done on IO5/IO6.");
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogWarning(ex, "GPIO quick test skipped/failed");
+                    }
+                    break;
+
+
+                default:
+                    Console.WriteLine("No valid choice. Exiting.");
+                    break;
             }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "Error during TX operations");
-            }
 
-            // RX //
-            // Start the notification loop
-            using var cts = new CancellationTokenSource();
-            Console.CancelKeyPress += (_, e) =>
-            {
-                e.Cancel = true;
-                cts.Cancel();
-            };
-
-            logger.LogInformation("Launching notification loop");
-            await notifier.RunAsync(cts.Token);
             logger.LogInformation("Application stopping");
         }
     }
 
 
-/// <summary>
-/// Driver for the EasyWave RX22 module.
-/// </summary>
-public class Rx22Driver : IDisposable
+
+    /// <summary>
+    /// Driver for the EasyWave RX22 module.
+    /// </summary>
+    public class Rx22Driver : IDisposable
     {
         private const byte SOP = 0x81;
         private const byte EOP = 0x82;
